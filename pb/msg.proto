@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package netsync.pb;
+
+option go_package = "github.com/MOHANKUMAR-IT/go-libp2p-netsync/pb";
+
+message ControlMessage {
+  string key = 1;
+  int64 deadline = 2; // Use timestamp or duration in nanoseconds
+  LockState lockState = 3;
+}
+
+enum LockState {
+  LOCK_INVALID = 0;
+  LOCK_ACQUIRED = 1;
+  LOCK_ACQUIRE_FAILED = 2;
+  LOCK_RELEASED = 3;
+  LOCK_RELEASE_FAILED = 4;
+  LOCK_TRY_ACQUIRE = 5;
+  LOCK_TRY_RELEASE = 6;
+}
+
