@@ -36,7 +36,7 @@ type NetSyncService struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	kdht        *dht.IpfsDHT
-	ServiceLock sync.Map
+	serviceLock sync.Map
 }
 
 func NewNetSyncService(ctx context.Context, host host.Host, kdht *dht.IpfsDHT) *NetSyncService {
@@ -46,12 +46,12 @@ func NewNetSyncService(ctx context.Context, host host.Host, kdht *dht.IpfsDHT) *
 		cancel:      cancel,
 		host:        host,
 		kdht:        kdht,
-		ServiceLock: sync.Map{},
+		serviceLock: sync.Map{},
 	}
 }
 
 func (ns *NetSyncService) Start() {
-	ns.host.SetStreamHandler(NetSyncProtocolID_v10, ns.HandleStream)
+	ns.host.SetStreamHandler(NetSyncProtocolID_v10, ns.handleStream)
 
 	go func() {
 		ticker := time.NewTicker(refreshTime)
@@ -62,10 +62,10 @@ func (ns *NetSyncService) Start() {
 			case <-ns.ctx.Done():
 				return
 			case <-ticker.C:
-				ns.ServiceLock.Range(func(key, value interface{}) bool {
+				ns.serviceLock.Range(func(key, value interface{}) bool {
 					expiryTime, ok := value.(time.Time)
 					if !ok || time.Now().After(expiryTime) {
-						ns.ServiceLock.Delete(key)
+						ns.serviceLock.Delete(key)
 					}
 					return true
 				})
@@ -79,7 +79,7 @@ func (ns *NetSyncService) Close() {
 	ns.host.RemoveStreamHandler(NetSyncProtocolID_v10)
 }
 
-func (ns *NetSyncService) HandleStream(stream network.Stream) {
+func (ns *NetSyncService) handleStream(stream network.Stream) {
 	defer stream.Close()
 
 	reader := protoio.NewDelimitedReader(stream, 1<<20) // Max message size: 1 MB
@@ -91,7 +91,7 @@ func (ns *NetSyncService) HandleStream(stream network.Stream) {
 		return
 	}
 
-	respLockState := ns.HandleLockRequest(&req)
+	respLockState := ns.handleLockRequest(&req)
 
 	resp := &pb.ControlMessage{
 		Key:       req.Key,
@@ -107,7 +107,7 @@ func (ns *NetSyncService) HandleStream(stream network.Stream) {
 	logger.Infof("Successfully processed lock request for key: %s", req.Key)
 }
 
-func (ns *NetSyncService) HandleLockRequest(msg *pb.ControlMessage) pb.LockState {
+func (ns *NetSyncService) handleLockRequest(msg *pb.ControlMessage) pb.LockState {
 	switch msg.LockState {
 	case pb.LockState_LOCK_TRY_ACQUIRE:
 		return ns.handleTryAcquireLock(msg)
@@ -119,7 +119,7 @@ func (ns *NetSyncService) HandleLockRequest(msg *pb.ControlMessage) pb.LockState
 }
 
 func (ns *NetSyncService) handleTryAcquireLock(msg *pb.ControlMessage) pb.LockState {
-	if _, ok := ns.ServiceLock.Load(msg.Key); ok {
+	if _, ok := ns.serviceLock.Load(msg.Key); ok {
 		return pb.LockState_LOCK_ACQUIRE_FAILED
 	}
 	deadline := time.Duration(msg.Deadline)
@@ -127,19 +127,19 @@ func (ns *NetSyncService) handleTryAcquireLock(msg *pb.ControlMessage) pb.LockSt
 		return pb.LockState_LOCK_ACQUIRE_FAILED
 	}
 	expiryTime := time.Now().Add(deadline)
-	ns.ServiceLock.Store(msg.Key, expiryTime)
+	ns.serviceLock.Store(msg.Key, expiryTime)
 	return pb.LockState_LOCK_ACQUIRED
 }
 
 func (ns *NetSyncService) handleTryReleaseLock(msg *pb.ControlMessage) pb.LockState {
-	if deadline, ok := ns.ServiceLock.Load(msg.Key); !ok {
+	if deadline, ok := ns.serviceLock.Load(msg.Key); !ok {
 		return pb.LockState_LOCK_RELEASED
 	} else {
 		if time.Now().Before(deadline.(time.Time)) {
 			return pb.LockState_LOCK_RELEASE_FAILED
 		}
 	}
-	ns.ServiceLock.Delete(msg.Key)
+	ns.serviceLock.Delete(msg.Key)
 	return pb.LockState_LOCK_RELEASED
 }
 
@@ -160,14 +160,19 @@ func (ns *Mutex) TryLock() bool {
 }
 
 func (ns *Mutex) Unlock() {
+	if deadline, ok := ns.ctx.Deadline(); ok {
+		if deadline.Sub(time.Now()) < time.Second*30 {
+			return
+		}
+	}
 	ns.service.releaseNetworkLock(ns.ctx, ns.cid)
 }
 
-func NewLock(ctx context.Context, service *NetSyncService, key string) *Mutex {
+func (ns *NetSyncService) NewLock(ctx context.Context, key string) *Mutex {
 	return &Mutex{
 		ctx:     ctx,
 		cid:     key,
-		service: service,
+		service: ns,
 	}
 }
 
