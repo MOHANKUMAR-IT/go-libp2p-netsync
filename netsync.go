@@ -7,12 +7,13 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-msgio/protoio"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,26 +33,41 @@ var (
 )
 
 type NetSyncService struct {
+	pb.UnimplementedNetSyncServiceServer
+
 	host        host.Host
 	ctx         context.Context
 	cancel      context.CancelFunc
 	kdht        *dht.IpfsDHT
 	serviceLock sync.Map
+
+	grpcServer *Server
 }
 
-func NewNetSyncService(ctx context.Context, host host.Host, kdht *dht.IpfsDHT) *NetSyncService {
+func NewNetSyncService(ctx context.Context, kdht *dht.IpfsDHT) *NetSyncService {
 	sctx, cancel := context.WithCancel(ctx)
+
 	return &NetSyncService{
 		ctx:         sctx,
 		cancel:      cancel,
-		host:        host,
+		host:        kdht.Host(),
 		kdht:        kdht,
 		serviceLock: sync.Map{},
+		grpcServer:  NewGrpcServer(sctx, kdht.Host()),
 	}
 }
 
-func (ns *NetSyncService) Start() {
-	ns.host.SetStreamHandler(NetSyncProtocolID_v10, ns.handleStream)
+func (ns *NetSyncService) Start() error {
+
+	pb.RegisterNetSyncServiceServer(ns.grpcServer, ns)
+
+	go func() {
+		err := ns.grpcServer.Serve()
+		if err != nil {
+			logger.Errorf("failed to start grpc server: %v", err)
+			ns.Close()
+		}
+	}()
 
 	go func() {
 		ticker := time.NewTicker(refreshTime)
@@ -63,8 +79,8 @@ func (ns *NetSyncService) Start() {
 				return
 			case <-ticker.C:
 				ns.serviceLock.Range(func(key, value interface{}) bool {
-					expiryTime, ok := value.(time.Time)
-					if !ok || time.Now().After(expiryTime) {
+					record := value.(syncRecord)
+					if time.Now().After(record.expiryTime) {
 						ns.serviceLock.Delete(key)
 					}
 					return true
@@ -72,6 +88,7 @@ func (ns *NetSyncService) Start() {
 			}
 		}
 	}()
+	return nil
 }
 
 func (ns *NetSyncService) Close() {
@@ -79,37 +96,18 @@ func (ns *NetSyncService) Close() {
 	ns.host.RemoveStreamHandler(NetSyncProtocolID_v10)
 }
 
-func (ns *NetSyncService) handleStream(stream network.Stream) {
-	defer stream.Close()
+func (ns *NetSyncService) ServiceRequest(ctx context.Context, req *pb.NetSyncMessage) (*pb.NetSyncMessage, error) {
 
-	reader := protoio.NewDelimitedReader(stream, 1<<20) // Max message size: 1 MB
-	writer := protoio.NewDelimitedWriter(stream)
+	respLockState := ns.handleLockRequest(req)
 
-	var req pb.ControlMessage
-	if err := reader.ReadMsg(&req); err != nil {
-		logger.Errorf("failed to read Protobuf message from stream: %v", err)
-		return
-	}
+	req.LockState = respLockState
 
-	respLockState := ns.handleLockRequest(&req)
-
-	resp := &pb.ControlMessage{
-		Key:       req.Key,
-		Deadline:  req.Deadline,
-		LockState: respLockState,
-	}
-
-	if err := writer.WriteMsg(resp); err != nil {
-		logger.Errorf("failed to write Protobuf message to stream: %v", err)
-		return
-	}
-
-	logger.Infof("Successfully processed lock request for key: %s", req.Key)
+	return req, nil
 }
 
-func (ns *NetSyncService) handleLockRequest(msg *pb.ControlMessage) pb.LockState {
+func (ns *NetSyncService) handleLockRequest(msg *pb.NetSyncMessage) pb.LockState {
 	switch msg.LockState {
-	case pb.LockState_LOCK_TRY_ACQUIRE:
+	case pb.LockState_LOCK_TRY_ACQUIRE, pb.LockState_LOCK_TRY_RS_ACQUIRE:
 		return ns.handleTryAcquireLock(msg)
 	case pb.LockState_LOCK_TRY_RELEASE:
 		return ns.handleTryReleaseLock(msg)
@@ -118,24 +116,39 @@ func (ns *NetSyncService) handleLockRequest(msg *pb.ControlMessage) pb.LockState
 	}
 }
 
-func (ns *NetSyncService) handleTryAcquireLock(msg *pb.ControlMessage) pb.LockState {
-	if _, ok := ns.serviceLock.Load(msg.Key); ok {
+type syncRecord struct {
+	expiryTime time.Time
+	peerID     string
+}
+
+func (ns *NetSyncService) handleTryAcquireLock(msg *pb.NetSyncMessage) pb.LockState {
+	if holdedBy, ok := ns.serviceLock.Load(msg.Key); ok && holdedBy.(syncRecord).peerID != msg.Peerid {
 		return pb.LockState_LOCK_ACQUIRE_FAILED
 	}
-	deadline := time.Duration(msg.Deadline)
-	if deadline > maxLockTime {
-		return pb.LockState_LOCK_ACQUIRE_FAILED
+
+	expiryTime := time.Now().Add(time.Minute)
+
+	ns.serviceLock.Store(msg.Key, syncRecord{
+		expiryTime: expiryTime,
+		peerID:     msg.Peerid,
+	})
+
+	if msg.LockState == pb.LockState_LOCK_TRY_ACQUIRE {
+		rctx, cancel := context.WithTimeout(ns.ctx, time.Second*10)
+		defer cancel()
+		if !ns.resolveConflict(rctx, msg) {
+			ns.serviceLock.Delete(msg.Key)
+			return pb.LockState_LOCK_ACQUIRE_FAILED
+		}
 	}
-	expiryTime := time.Now().Add(deadline)
-	ns.serviceLock.Store(msg.Key, expiryTime)
 	return pb.LockState_LOCK_ACQUIRED
 }
 
-func (ns *NetSyncService) handleTryReleaseLock(msg *pb.ControlMessage) pb.LockState {
+func (ns *NetSyncService) handleTryReleaseLock(msg *pb.NetSyncMessage) pb.LockState {
 	if deadline, ok := ns.serviceLock.Load(msg.Key); !ok {
 		return pb.LockState_LOCK_RELEASED
 	} else {
-		if time.Now().Before(deadline.(time.Time)) {
+		if time.Now().Before(deadline.(syncRecord).expiryTime) {
 			return pb.LockState_LOCK_RELEASE_FAILED
 		}
 	}
@@ -146,85 +159,100 @@ func (ns *NetSyncService) handleTryReleaseLock(msg *pb.ControlMessage) pb.LockSt
 type Locker interface {
 	TryLock() bool
 	Unlock()
+	IsAcquired() bool
 }
 
 type Mutex struct {
 	cid      string
 	ctx      context.Context
+	cancel   context.CancelFunc
 	service  *NetSyncService
-	acquired bool
+	acquired atomic.Bool
 }
 
-func (ns *Mutex) TryLock() bool {
-	return ns.service.acquireNetworkLock(ns.ctx, ns.cid)
+func (mtx *Mutex) IsAcquired() bool {
+	return mtx.acquired.Load()
 }
 
-func (ns *Mutex) Unlock() {
-	if deadline, ok := ns.ctx.Deadline(); ok {
-		if deadline.Sub(time.Now()) < time.Second*30 {
-			return
-		}
+func (mtx *Mutex) TryLock() bool {
+	if mtx.service == nil {
+		return false
 	}
-	ns.service.releaseNetworkLock(ns.ctx, ns.cid)
+	return mtx.service.acquireNetworkLock(mtx)
 }
 
-func (ns *NetSyncService) NewLock(ctx context.Context, key string) *Mutex {
+func (mtx *Mutex) Unlock() {
+	mtx.cancel()
+	//mtx.ctx, mtx.cancel = context.WithTimeout(mtx.service.ctx, time.Second*30)
+	//defer mtx.cancel()
+	//mtx.service.releaseNetworkLock(mtx)
+}
+
+func (ns *NetSyncService) NewLock(ctx context.Context, key string) (*Mutex, error) {
+	if key == "" {
+		return nil, fmt.Errorf("key cannot be empty")
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	return &Mutex{
 		ctx:     ctx,
+		cancel:  cancel,
 		cid:     key,
 		service: ns,
-	}
+	}, nil
 }
 
-func (ns *NetSyncService) acquireNetworkLock(ctx context.Context, key string) bool {
-	rmsg, err := createLockRequestMsg(ctx, key, pb.LockState_LOCK_TRY_ACQUIRE)
-	if err != nil {
-		logger.Errorf("failed to create lock request message: %v", err)
-		return false
+func (ns *NetSyncService) acquireNetworkLock(mtx *Mutex) bool {
+
+	rmsg := &pb.NetSyncMessage{
+		Key:       mtx.cid,
+		Peerid:    ns.host.ID().String(),
+		LockState: pb.LockState_LOCK_TRY_ACQUIRE,
 	}
 
-	closestPeers, err := ns.getSortedClosestPeers(ctx, key)
-	if err != nil {
-		logger.Errorf("failed to get closest peers: %v", err)
-		return false
+	lock := func() bool {
+		closestPeers, err := ns.getSortedClosestPeers(mtx.ctx, mtx.cid)
+		if err != nil {
+			return false
+		}
+
+		return ns.processLockRequest(mtx.ctx, closestPeers, rmsg, pb.LockState_LOCK_ACQUIRED)
 	}
 
-	return ns.processLockRequest(ctx, closestPeers, rmsg, pb.LockState_LOCK_ACQUIRED)
+	firstLockStatus := lock()
+
+	if firstLockStatus {
+		go func() {
+			for {
+				select {
+				case <-mtx.ctx.Done():
+					return
+				case <-time.After(time.Second * 50):
+					if !lock() {
+						mtx.acquired.Store(false)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	return firstLockStatus
+
 }
 
-func (ns *NetSyncService) releaseNetworkLock(ctx context.Context, key string) bool {
-	rmsg, err := createLockRequestMsg(ctx, key, pb.LockState_LOCK_TRY_RELEASE)
+func (ns *NetSyncService) releaseNetworkLock(mtx *Mutex) bool {
+	rmsg := &pb.NetSyncMessage{
+		Key:       mtx.cid,
+		Peerid:    ns.host.ID().String(),
+		LockState: pb.LockState_LOCK_TRY_RELEASE,
+	}
+
+	closestPeers, err := ns.getSortedClosestPeers(mtx.ctx, mtx.cid)
 	if err != nil {
-		logger.Errorf("failed to create lock request message: %v", err)
 		return false
 	}
 
-	closestPeers, err := ns.getSortedClosestPeers(ctx, key)
-	if err != nil {
-		logger.Errorf("failed to get closest peers: %v", err)
-		return false
-	}
-
-	return ns.processLockRequest(ctx, closestPeers, rmsg, pb.LockState_LOCK_RELEASED)
-}
-
-func createLockRequestMsg(ctx context.Context, key string, lockState pb.LockState) (*pb.ControlMessage, error) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return nil, ErrInvalidContext
-	}
-	duration := time.Until(deadline)
-	if duration <= 0 {
-		return nil, ErrInvalidContext
-	}
-
-	msg := &pb.ControlMessage{
-		Key:       key,
-		Deadline:  duration.Nanoseconds(),
-		LockState: lockState,
-	}
-
-	return msg, nil
+	return ns.processLockRequest(mtx.ctx, closestPeers, rmsg, pb.LockState_LOCK_RELEASED)
 }
 
 func (ns *NetSyncService) getSortedClosestPeers(ctx context.Context, key string) ([]peer.ID, error) {
@@ -241,13 +269,16 @@ func (ns *NetSyncService) getSortedClosestPeers(ctx context.Context, key string)
 	return closestPeers, nil
 }
 
-func (ns *NetSyncService) processLockRequest(ctx context.Context, closestPeers []peer.ID, rmsg *pb.ControlMessage, expectedState pb.LockState) bool {
+func (ns *NetSyncService) processLockRequest(ctx context.Context, closestPeers []peer.ID, rmsg *pb.NetSyncMessage, expectedState pb.LockState) bool {
 	for _, pid := range closestPeers {
-		response, err := ns.contactPeer(ctx, pid, rmsg)
+		sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		response, err := ns.contactPeer(sctx, pid, rmsg)
 		if err != nil {
-			logger.Warnf("error contacting peer %s: %v", pid, err)
+			cancel()
 			continue
 		}
+		cancel()
+
 		if response.LockState == expectedState {
 			return true
 		}
@@ -256,38 +287,32 @@ func (ns *NetSyncService) processLockRequest(ctx context.Context, closestPeers [
 	return false
 }
 
-func (ns *NetSyncService) contactPeer(ctx_g context.Context, pid peer.ID, msg *pb.ControlMessage) (*pb.ControlMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx_g, 5*time.Second)
+func (ns *NetSyncService) contactPeer(ctx context.Context, pid peer.ID, msg *pb.NetSyncMessage) (*pb.NetSyncMessage, error) {
+	ctx_f, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	pad, err := ns.kdht.FindPeer(ctx, pid)
+	pad, err := ns.kdht.FindPeer(ctx_f, pid)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to find peer: %v", err)
 	}
-	if err = ns.host.Connect(ctx, pad); err != nil {
-		return nil, err
+	if err = ns.host.Connect(ctx_f, pad); err != nil {
+		return nil, fmt.Errorf("failed to connect to peer: %v", err)
 	}
 
-	peerStream, err := ns.host.NewStream(ctx, pid, NetSyncProtocolID_v10)
+	grpcClient := NewClient(ns.host, NetSyncProtocolID_v10, WithServer(ns.grpcServer))
+
+	conn, err := grpcClient.Dial(ctx, pid, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
 	if err != nil {
-		return nil, err
-	}
-	defer peerStream.Close()
-
-	peerStream.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	writer := protoio.NewDelimitedWriter(peerStream)
-	if err := writer.WriteMsg(msg); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create grpc client: %v", err)
 	}
 
-	reader := protoio.NewDelimitedReader(peerStream, 1<<20) // Max size: 1 MB
-	var resp pb.ControlMessage
-	if err := reader.ReadMsg(&resp); err != nil {
-		return nil, err
+	resp, err := pb.NewNetSyncServiceClient(conn).ServiceRequest(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to handle message: %v", err)
 	}
 
-	return &resp, nil
+	return resp, nil
 }
 
 func calculateXORDistance(a, b string) uint64 {
