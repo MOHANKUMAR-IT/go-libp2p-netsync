@@ -1,4 +1,10 @@
+
 # 🔒 go-libp2p-netsync
+
+<p align="center">
+  <img src="097e47f7-0580-41e0-894e-29102f3c1da0.jpeg" alt="Logo" width="300">
+</p>
+
 **A lightweight distributed locking service for decentralized systems.**
 
 `go-libp2p-netsync` is a peer-to-peer distributed locking solution designed to coordinate resource access in decentralized environments. Built on top of the robust **Libp2p networking stack**, this service leverages the **Libp2p DHT** for peer discovery and communication while utilizing **Protocol Buffers (Protobuf)** for efficient and lightweight message serialization.
